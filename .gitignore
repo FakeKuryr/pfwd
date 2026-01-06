@@ -1,0 +1,16 @@
+# Build artifacts
+/target
+/dist
+/bin
+
+# IDE & editor junk
+.DS_Store
+/.idea
+.vscode/
+*.swp
+*.swo
+
+# Temporary env/config
+.env
+.env.*
+/tmp
