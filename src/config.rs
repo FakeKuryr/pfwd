@@ -3,6 +3,7 @@ use std::fmt;
 use std::fs;
 use std::path::{Path, PathBuf};
 use std::str::FromStr;
+use std::time::Duration;
 
 use anyhow::{Context, Result, bail};
 use clap::Parser;
@@ -23,13 +24,20 @@ pub struct Cli {
 
     /// Inline forward specifications. Each entry is a comma-separated key=value list.
     ///
-    /// Keys: listen, namespace, setns_path, uds, target, mode, owner, backlog, label.
+    /// Keys: listen, udp_listen, namespace, setns_path, uds, target, udp_target, mode, owner,
+    /// backlog, label, udp_idle_timeout.
     ///
     /// Example (host proxy):
     /// --forward listen=0.0.0.0:2222,uds=/run/qdhcp/ssh.sock
     ///
     /// Example (namespace endpoint):
     /// --forward namespace=qdhcp-1234,uds=/run/qdhcp/ssh.sock,target=192.168.31.201:22
+    ///
+    /// Example (direct tcp proxy):
+    /// --forward listen=0.0.0.0:8443,target=10.0.0.23:443
+    ///
+    /// Example (udp proxy):
+    /// --forward udp_listen=0.0.0.0:5353,udp_target=192.168.31.10:53,udp_idle_timeout=600
     #[arg(long = "forward", value_name = "key=value")]
     pub inline_forwards: Vec<ForwardInline>,
 }
@@ -77,6 +85,15 @@ impl FromStr for ForwardInline {
         if let Some(label) = map.remove("label") {
             spec.label = Some(label);
         }
+        if let Some(udp_listen) = map.remove("udp_listen") {
+            spec.udp_listen = Some(udp_listen);
+        }
+        if let Some(udp_target) = map.remove("udp_target") {
+            spec.udp_target = Some(udp_target);
+        }
+        if let Some(timeout) = map.remove("udp_idle_timeout") {
+            spec.udp_idle_timeout_secs = Some(timeout.parse()?);
+        }
 
         if !map.is_empty() {
             bail!(
@@ -101,6 +118,8 @@ pub struct FileConfig {
 #[derive(Debug, Deserialize, Default, Clone)]
 pub struct Defaults {
     #[serde(default)]
+    pub log_level: Option<String>,
+    #[serde(default)]
     pub uds_dir: Option<PathBuf>,
     #[serde(default)]
     pub mode: Option<u32>,
@@ -108,6 +127,8 @@ pub struct Defaults {
     pub owner: Option<Owner>,
     #[serde(default)]
     pub backlog: Option<u32>,
+    #[serde(default)]
+    pub udp_idle_timeout_secs: Option<u64>,
 }
 
 #[serde_as]
@@ -131,6 +152,12 @@ pub struct ForwardSpec {
     pub owner: Option<Owner>,
     #[serde(default)]
     pub backlog: Option<u32>,
+    #[serde(default)]
+    pub udp_listen: Option<String>,
+    #[serde(default)]
+    pub udp_target: Option<String>,
+    #[serde(default)]
+    pub udp_idle_timeout_secs: Option<u64>,
 }
 
 impl ForwardSpec {
@@ -144,6 +171,9 @@ impl ForwardSpec {
         if self.backlog.is_none() {
             self.backlog = defaults.backlog;
         }
+        if self.udp_idle_timeout_secs.is_none() {
+            self.udp_idle_timeout_secs = defaults.udp_idle_timeout_secs;
+        }
         if self.uds.is_none()
             && let (Some(dir), Some(label)) = (defaults.uds_dir.as_ref(), self.label.as_ref())
         {
@@ -152,30 +182,86 @@ impl ForwardSpec {
     }
 
     pub fn validate(&self) -> Result<()> {
-        if self.uds.is_none() {
-            bail!("missing uds path (set `uds` or provide defaults.uds_dir + label)");
-        }
-        if self.listen.is_none() && self.namespace.is_none() && self.setns_path.is_none() {
+        if self.listen.is_none()
+            && self.namespace.is_none()
+            && self.setns_path.is_none()
+            && self.udp_listen.is_none()
+        {
             bail!(
-                "forward spec must define at least one of `listen`, `namespace`, or `setns_path`"
+                "forward spec must define a listener (`listen`, `udp_listen`) or namespace entry point"
             );
+        }
+
+        if self.requires_uds_path() && self.uds.is_none() {
+            bail!("missing uds path (set `uds` or provide defaults.uds_dir + label)");
         }
         if self.requires_namespace_endpoint() && self.target.is_none() {
             bail!("namespace endpoint requires `target` to be set");
         }
+
+        if self.listen.is_some()
+            && !self.requires_host_uds_proxy()
+            && !self.requires_direct_tcp_proxy()
+        {
+            bail!(
+                "tcp listeners must set `uds` for UDS bridging or `target` for direct TCP proxying"
+            );
+        }
+
+        if self.requires_direct_tcp_proxy()
+            && (self.namespace.is_some() || self.setns_path.is_some())
+        {
+            bail!("direct TCP proxy cannot mix with namespace settings");
+        }
+
+        if self.requires_direct_tcp_proxy() && self.uds.is_some() {
+            bail!("direct TCP proxy should not define a UDS path");
+        }
+
+        match (self.udp_listen.as_ref(), self.udp_target.as_ref()) {
+            (Some(_), Some(_)) => {}
+            (None, None) => {}
+            _ => bail!("udp proxies require both `udp_listen` and `udp_target`"),
+        }
+
+        if let Some(timeout) = self.udp_idle_timeout_secs {
+            if timeout == 0 {
+                bail!("udp_idle_timeout_secs must be greater than zero");
+            }
+        }
+
         Ok(())
+    }
+
+    fn requires_uds_path(&self) -> bool {
+        self.requires_namespace_endpoint() || self.requires_host_uds_proxy()
     }
 
     pub fn requires_namespace_endpoint(&self) -> bool {
         self.target.is_some() && (self.namespace.is_some() || self.setns_path.is_some())
     }
 
-    pub fn requires_host_proxy(&self) -> bool {
+    pub fn requires_host_uds_proxy(&self) -> bool {
+        self.listen.is_some() && self.uds.is_some()
+    }
+
+    pub fn requires_direct_tcp_proxy(&self) -> bool {
         self.listen.is_some()
+            && self.uds.is_none()
+            && self.target.is_some()
+            && !self.requires_namespace_endpoint()
+    }
+
+    pub fn requires_udp_proxy(&self) -> bool {
+        self.udp_listen.is_some() && self.udp_target.is_some()
     }
 
     pub fn uds_path(&self) -> &Path {
         self.uds.as_ref().expect("validated")
+    }
+
+    pub fn udp_idle_timeout(&self) -> Duration {
+        Duration::from_secs(self.udp_idle_timeout_secs.unwrap_or(300))
     }
 }
 

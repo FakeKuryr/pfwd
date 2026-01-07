@@ -9,8 +9,8 @@ use crate::config::ForwardSpec;
 
 #[cfg(target_os = "linux")]
 pub fn maybe_enter(spec: &ForwardSpec) -> Result<()> {
-    use std::fs::File;
     use nix::sched::{CloneFlags, setns};
+    use std::fs::File;
 
     let Some(path) = desired_netns_path(spec) else {
         return Ok(());

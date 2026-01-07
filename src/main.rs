@@ -1,6 +1,7 @@
 mod config;
 mod forward;
 mod netns;
+mod pipeline;
 mod uds;
 
 use anyhow::Result;
@@ -13,8 +14,9 @@ use crate::config::{Cli, load_config};
 async fn main() -> Result<()> {
     maybe_print_long_help();
     let cli = Cli::parse();
-    init_tracing(cli.log_level.as_deref());
-    let (_defaults, specs) = load_config(&cli)?;
+    let (defaults, specs) = load_config(&cli)?;
+    let chosen_level = cli.log_level.as_deref().or(defaults.log_level.as_deref());
+    init_tracing(chosen_level);
     if specs.is_empty() {
         tracing::warn!("no forward entries configured");
         return Ok(());
